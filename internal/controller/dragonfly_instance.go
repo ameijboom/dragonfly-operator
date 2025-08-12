@@ -439,57 +439,65 @@ func (dfi *DragonflyInstance) reconcileResources(ctx context.Context) error {
 	}
 	for _, desired := range dfResources {
 		dfi.log.Info("reconciling dragonfly resource", "kind", getGVK(desired, dfi.scheme).Kind, "namespace", desired.GetNamespace(), "Name", desired.GetName())
+
+		existing := desired.DeepCopyObject().(client.Object)
+		err = dfi.client.Get(ctx, client.ObjectKey{
+			Namespace: desired.GetNamespace(),
+			Name:      desired.GetName(),
+		}, existing)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to get resource: %w", err)
+			}
+			// Resource does not exist, create it
+			if err := controllerutil.SetControllerReference(dfi.df, desired, dfi.scheme); err != nil {
+				return fmt.Errorf("failed to set controller reference: %w", err)
+			}
+			err = dfi.client.Create(ctx, desired)
+			if err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+			dfi.log.Info("created resource", "resource", desired.GetName())
+			continue
+		}
+		// Resource exists, prepare desired for potential update
 		if err := controllerutil.SetControllerReference(dfi.df, desired, dfi.scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference: %w", err)
 		}
-		err = dfi.client.Create(ctx, desired)
-		if err != nil {
-			if !apierrors.IsAlreadyExists(err) {
-				return fmt.Errorf("failed to create resource: %w", err)
-			}
-			// Resource exists, fetch it
-			existing := desired.DeepCopyObject().(client.Object)
-			if err = dfi.client.Get(ctx, client.ObjectKey{
-				Namespace: desired.GetNamespace(),
-				Name:      desired.GetName(),
-			}, existing); err != nil {
-				return fmt.Errorf("failed to get resource: %w", err)
-			}
-			// Special handling for Services to preserve immutable fields
-			if svcDesired, ok := desired.(*corev1.Service); ok {
-				if svcExisting, ok := existing.(*corev1.Service); ok {
-					svcDesired.Spec.ClusterIP = svcExisting.Spec.ClusterIP
-					svcDesired.Spec.IPFamilies = svcExisting.Spec.IPFamilies
-					svcDesired.Spec.IPFamilyPolicy = svcExisting.Spec.IPFamilyPolicy
-					// Preserve NodePorts for NodePort and LoadBalancer services
-					if svcDesired.Spec.Type == corev1.ServiceTypeNodePort || svcDesired.Spec.Type == corev1.ServiceTypeLoadBalancer {
-						for i := range svcDesired.Spec.Ports {
-							for j := range svcExisting.Spec.Ports {
-								if svcDesired.Spec.Ports[i].Name == svcExisting.Spec.Ports[j].Name {
-									svcDesired.Spec.Ports[i].NodePort = svcExisting.Spec.Ports[j].NodePort
-									break
-								}
+		// Special handling for Services to preserve immutable fields
+		if svcDesired, ok := desired.(*corev1.Service); ok {
+			if svcExisting, ok := existing.(*corev1.Service); ok {
+				svcDesired.Spec.ClusterIP = svcExisting.Spec.ClusterIP
+				svcDesired.Spec.IPFamilies = svcExisting.Spec.IPFamilies
+				svcDesired.Spec.IPFamilyPolicy = svcExisting.Spec.IPFamilyPolicy
+				// Preserve NodePorts for NodePort and LoadBalancer services
+				if svcDesired.Spec.Type == corev1.ServiceTypeNodePort || svcDesired.Spec.Type == corev1.ServiceTypeLoadBalancer {
+					for i := range svcDesired.Spec.Ports {
+						for j := range svcExisting.Spec.Ports {
+							if svcDesired.Spec.Ports[i].Name == svcExisting.Spec.Ports[j].Name {
+								svcDesired.Spec.Ports[i].NodePort = svcExisting.Spec.Ports[j].NodePort
+								break
 							}
 						}
 					}
-					// Also preserve HealthCheckNodePort if external
-					if svcDesired.Spec.Type == corev1.ServiceTypeLoadBalancer && svcDesired.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
-						svcDesired.Spec.HealthCheckNodePort = svcExisting.Spec.HealthCheckNodePort
-					}
+				}
+				// Also preserve HealthCheckNodePort if external
+				if svcDesired.Spec.Type == corev1.ServiceTypeLoadBalancer && svcDesired.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
+					svcDesired.Spec.HealthCheckNodePort = svcExisting.Spec.HealthCheckNodePort
 				}
 			}
-			// Compare specs; skip if no changes
-			if resourceSpecsEqual(desired, existing) {
-				dfi.log.Info("no changes detected, skipping update", "resource", desired.GetName())
-				continue
-			}
-			// Update if specs differ
-			desired.SetResourceVersion(existing.GetResourceVersion())
-			if err = dfi.client.Update(ctx, desired); err != nil {
-				return fmt.Errorf("failed to update resource: %w", err)
-			}
-			dfi.log.Info("updated resource", "resource", desired.GetName())
 		}
+		// Compare specs; skip if no changes
+		if resourceSpecsEqual(desired, existing) {
+			dfi.log.Info("no changes detected, skipping update", "resource", desired.GetName())
+			continue
+		}
+		// Update if specs differ
+		desired.SetResourceVersion(existing.GetResourceVersion())
+		if err = dfi.client.Update(ctx, desired); err != nil {
+			return fmt.Errorf("failed to update resource: %w", err)
+		}
+		dfi.log.Info("updated resource", "resource", desired.GetName())
 	}
 	if dfi.df.Spec.Replicas < 2 {
 		if err = dfi.client.Delete(ctx, &policyv1.PodDisruptionBudget{
